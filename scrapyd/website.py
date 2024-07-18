@@ -218,6 +218,8 @@ monitoring)</p>
 
 <p>For more information about the API, see the
 <a href="https://scrapyd.readthedocs.io/en/latest/">Scrapyd documentation</a></p>
+
+<p>Huntress</p>
 </body>
 </html>
 """
