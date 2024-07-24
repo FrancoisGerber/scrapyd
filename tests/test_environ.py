@@ -1,7 +1,6 @@
 import os
 
 import pytest
-from twisted.trial import unittest
 from zope.interface.verify import verifyObject
 
 from scrapyd.config import Config
@@ -9,62 +8,39 @@ from scrapyd.environ import Environment
 from scrapyd.exceptions import DirectoryTraversalError
 from scrapyd.interfaces import IEnvironment
 
-msg = {'_project': 'mybot', '_spider': 'myspider', '_job': 'ID'}
-slot = 3
+msg = {"_project": "mybot", "_spider": "myspider", "_job": "ID"}
 
 
-class EnvironmentTest(unittest.TestCase):
+@pytest.fixture()
+def environ(tmpdir):
+    config = Config(values={"eggs_dir": tmpdir, "logs_dir": tmpdir})
+    config.cp.add_section("settings")
+    config.cp.set("settings", "newbot", "newbot.settings")
+    return Environment(config, initenv={})
 
-    def setUp(self):
-        d = self.mktemp()
-        os.mkdir(d)
-        config = Config(values={'eggs_dir': d, 'logs_dir': d})
-        config.cp.add_section('settings')
-        config.cp.set('settings', 'newbot', 'newbot.settings')
 
-        self.environ = Environment(config, initenv={})
+def test_interface(environ):
+    verifyObject(IEnvironment, environ)
 
-    def test_interface(self):
-        verifyObject(IEnvironment, self.environ)
 
-    def test_get_environment_with_eggfile(self):
-        env = self.environ.get_environment(msg, slot)
+def test_get_environment_with_eggfile(environ):
+    env = environ.get_environment(msg, 3)
 
-        self.assertEqual(env['SCRAPY_PROJECT'], 'mybot')
-        self.assertEqual(env['SCRAPYD_SLOT'], '3')
-        self.assertEqual(env['SCRAPYD_SPIDER'], 'myspider')
-        self.assertEqual(env['SCRAPYD_JOB'], 'ID')
-        self.assert_(env['SCRAPYD_LOG_FILE'].endswith(os.path.join('mybot', 'myspider', 'ID.log')))
-        if env.get('SCRAPYD_FEED_URI'):  # Not compulsory
-            self.assert_(env['SCRAPYD_FEED_URI'].startswith('file://{}'.format(os.getcwd())))
-            self.assert_(env['SCRAPYD_FEED_URI'].endswith(os.path.join('mybot', 'myspider', 'ID.jl')))
-        self.assertNotIn('SCRAPY_SETTINGS_MODULE', env)
+    assert env["SCRAPY_PROJECT"] == "mybot"
+    assert "SCRAPY_SETTINGS_MODULE" not in env
 
-    def test_get_environment_with_no_items_dir(self):
-        config = Config(values={'items_dir': '', 'logs_dir': ''})
-        config.cp.add_section('settings')
-        config.cp.set('settings', 'newbot', 'newbot.settings')
 
-        environ = Environment(config, initenv={})
-        env = environ.get_environment(msg, slot)
+@pytest.mark.parametrize("values", [{"items_dir": "../items"}, {"logs_dir": "../logs"}])
+@pytest.mark.parametrize(("key", "value"), [("_project", "../p"), ("_spider", "../s"), ("_job", "../j")])
+def test_get_environment_secure(values, key, value):
+    config = Config(values=values)
+    environ = Environment(config, initenv={})
 
-        self.assertNotIn('SCRAPYD_FEED_URI', env)
-        self.assertNotIn('SCRAPYD_LOG_FILE', env)
+    with pytest.raises(DirectoryTraversalError) as exc:
+        environ.get_settings({**msg, key: value})
 
-    def test_get_environment_secure(self):
-        for values in ({'items_dir': '../items'}, {'logs_dir': '../logs'}):
-            with self.subTest(values=values):
-                config = Config(values=values)
-
-                environ = Environment(config, initenv={})
-                for k, v in (('_project', '../p'), ('_spider', '../s'), ('_job', '../j')):
-                    with self.subTest(key=k, value=v):
-                        with pytest.raises(DirectoryTraversalError) as exc:
-                            environ.get_environment({**msg, k: v}, slot)
-
-                        self.assertEqual(
-                            str(exc.value),
-                            f"{v if k == '_project' else 'mybot'}/"
-                            f"{v if k == '_spider' else 'myspider'}/"
-                            f"{v if k == '_job' else 'ID'}.log"
-                        )
+    assert str(exc.value) == (
+        f"{value if key == '_project' else 'mybot'}{os.sep}"
+        f"{value if key == '_spider' else 'myspider'}{os.sep}"
+        f"{value if key == '_job' else 'ID'}.log"
+    )

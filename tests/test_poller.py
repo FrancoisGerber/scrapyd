@@ -1,7 +1,7 @@
 import os
 
+import pytest
 from twisted.internet.defer import Deferred
-from twisted.trial import unittest
 from zope.interface.verify import verifyObject
 
 from scrapyd.config import Config
@@ -10,54 +10,73 @@ from scrapyd.poller import QueuePoller
 from scrapyd.utils import get_spider_queues
 
 
-class QueuePollerTest(unittest.TestCase):
+@pytest.fixture()
+def poller(tmpdir):
+    eggs_dir = os.path.join(tmpdir, "eggs")
+    dbs_dir = os.path.join(tmpdir, "dbs")
+    config = Config(values={"eggs_dir": eggs_dir, "dbs_dir": dbs_dir})
+    os.makedirs(os.path.join(eggs_dir, "mybot1"))
+    os.makedirs(os.path.join(eggs_dir, "mybot2"))
+    return QueuePoller(config)
 
-    def setUp(self):
-        d = self.mktemp()
-        eggs_dir = os.path.join(d, 'eggs')
-        dbs_dir = os.path.join(d, 'dbs')
-        os.makedirs(eggs_dir)
-        os.makedirs(dbs_dir)
-        os.makedirs(os.path.join(eggs_dir, 'mybot1'))
-        os.makedirs(os.path.join(eggs_dir, 'mybot2'))
-        config = Config(values={'eggs_dir': eggs_dir, 'dbs_dir': dbs_dir})
-        self.queues = get_spider_queues(config)
-        self.poller = QueuePoller(config)
 
-    def test_interface(self):
-        verifyObject(IPoller, self.poller)
+def test_interface(poller):
+    verifyObject(IPoller, poller)
 
-    def test_poll_next(self):
-        cfg = {'mybot1': 'spider1',
-               'mybot2': 'spider2'}
-        priority = 0
-        for prj, spd in cfg.items():
-            self.queues[prj].add(spd, priority)
 
-        d1 = self.poller.next()
-        d2 = self.poller.next()
+# Need sorted(), because os.listdir() in FilesystemEggStorage.list_projects() uses an arbitrary order.
+def test_list_projects_update_projects(poller):
+    assert sorted(poller.queues) == ["mybot1", "mybot2"]
 
-        self.assertIsInstance(d1, Deferred)
-        self.assertFalse(hasattr(d1, 'result'))
+    os.makedirs(os.path.join(poller.config.get("eggs_dir"), "mybot3"))
 
-        # poll once
-        self.poller.poll()
+    assert sorted(poller.queues) == ["mybot1", "mybot2"]
 
-        self.assertTrue(hasattr(d1, 'result'))
-        self.assertTrue(getattr(d1, 'called', False))
+    poller.update_projects()
 
-        # which project got run: project1 or project2?
-        self.assertTrue(d1.result.get('_project'))
+    assert sorted(poller.queues) == ["mybot1", "mybot2", "mybot3"]
 
-        prj = d1.result['_project']
 
-        self.assertEqual(d1.result['_spider'], cfg.pop(prj))
+def test_poll_next(poller):
+    queues = get_spider_queues(poller.config)
 
-        self.queues[prj].pop()
+    scenario = {"mybot1": "spider1", "mybot2": "spider2"}
+    for project, spider in scenario.items():
+        queues[project].add(spider)
 
-        # poll twice
-        # check that the other project's spider got to run
-        self.poller.poll()
-        prj, spd = cfg.popitem()
+    deferred1 = poller.next()
+    deferred2 = poller.next()
 
-        self.assertEqual(d2.result, {'_project': prj, '_spider': spd})
+    assert isinstance(deferred1, Deferred)
+    assert not hasattr(deferred1, "result")
+    assert isinstance(deferred2, Deferred)
+    assert not hasattr(deferred2, "result")
+
+    value = poller.poll()
+
+    assert isinstance(value, Deferred)
+    assert hasattr(value, "result")
+    assert getattr(value, "called", False)
+    assert value.result is None
+
+    assert hasattr(deferred1, "result")
+    assert getattr(deferred1, "called", False)
+    assert hasattr(deferred2, "result")
+    assert getattr(deferred2, "called", False)
+
+    # os.listdir() in FilesystemEggStorage.list_projects() uses an arbitrary order.
+    project_a = deferred1.result["_project"]
+    spider_a = scenario.pop(project_a)
+    project_b, spider_b = scenario.popitem()
+
+    assert deferred1.result["_spider"] == spider_a
+    assert deferred2.result == {"_project": project_b, "_spider": spider_b}
+
+
+def test_poll_empty(poller):
+    value = poller.poll()
+
+    assert isinstance(value, Deferred)
+    assert hasattr(value, "result")
+    assert getattr(value, "called", False)
+    assert value.result is None

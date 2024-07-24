@@ -1,20 +1,20 @@
-from io import BytesIO
-from unittest.mock import patch
+import io
+import os.path
+from contextlib import closing
 
 import pytest
-from twisted.trial import unittest
 from zope.interface import implementer
 from zope.interface.verify import verifyObject
 
 from scrapyd.app import application
 from scrapyd.config import Config
-from scrapyd.eggstorage import FilesystemEggStorage
-from scrapyd.exceptions import DirectoryTraversalError
+from scrapyd.eggstorage import FilesystemEggStorage, sorted_versions
+from scrapyd.exceptions import DirectoryTraversalError, EggNotFoundError, ProjectNotFoundError
 from scrapyd.interfaces import IEggStorage
 
 
 @implementer(IEggStorage)
-class SomeFakeEggStorage:
+class MockEggStorage:
     def __init__(self, config):
         self.config = config
 
@@ -28,115 +28,194 @@ class SomeFakeEggStorage:
         pass
 
     def list_projects(self):
-        return ['hello_world']
+        return ["hello_world"]
 
     def delete(self, project, version=None):
         pass
 
 
-class TestConfigureEggStorage(unittest.TestCase):
-    def test_egg_config_application(self):
-        config = Config()
-        eggstore = 'tests.test_eggstorage.SomeFakeEggStorage'
-        config.cp.set('scrapyd', 'eggstorage', eggstore)
-        app = application(config)
-        app_eggstorage = app.getComponent(IEggStorage)
-
-        self.assertIsInstance(app_eggstorage, SomeFakeEggStorage)
-        self.assertEqual(app_eggstorage.list_projects(), ['hello_world'])
+@pytest.fixture()
+def eggstorage(tmpdir):
+    return FilesystemEggStorage(Config(values={"eggs_dir": tmpdir}))
 
 
-class EggStorageTest(unittest.TestCase):
+@pytest.mark.parametrize(
+    ("versions", "expected"),
+    [
+        # letter
+        (["zzz", "b", "ddd", "a", "x"], ["a", "b", "ddd", "x", "zzz"]),
+        # number
+        (["10", "1", "9"], ["1", "9", "10"]),
+        # "r" number
+        (["r10", "r1", "r9"], ["r1", "r10", "r9"]),
+        # version
+        (["2.11", "2.01", "2.9"], ["2.01", "2.9", "2.11"]),
+        # number and letter
+        (["123456789", "b3b8fd2"], ["123456789", "b3b8fd2"]),
+    ],
+)
+def test_sorted_versions(versions, expected):
+    assert sorted_versions(versions) == expected
 
-    def setUp(self):
-        d = self.mktemp()
-        config = Config(values={'eggs_dir': d})
-        self.eggst = FilesystemEggStorage(config)
 
-    def test_interface(self):
-        verifyObject(IEggStorage, self.eggst)
+def test_config(chdir):
+    config = Config()
+    config.cp.set("scrapyd", "eggstorage", "tests.test_eggstorage.MockEggStorage")
 
-    def test_put_secure(self):
-        with pytest.raises(DirectoryTraversalError) as exc:
-            self.eggst.put(BytesIO(b"egg01"), "../p", "v")  # version is sanitized
+    app = application(config)
+    eggstorage = app.getComponent(IEggStorage)
 
-        self.assertEqual(str(exc.value), "../p")
+    assert isinstance(eggstorage, MockEggStorage)
+    assert eggstorage.list_projects() == ["hello_world"]
 
-    def test_get_secure(self):
-        with pytest.raises(DirectoryTraversalError) as exc:
-            self.eggst.get("../p", "v")  # version is sanitized
 
-        self.assertEqual(str(exc.value), "../p")
+def test_interface(eggstorage):
+    verifyObject(IEggStorage, eggstorage)
 
-    def test_list_secure_join(self):
-        with pytest.raises(DirectoryTraversalError) as exc:
-            self.eggst.list('../p')
 
-        self.assertEqual(str(exc.value), "../p")
+def test_put_secure(eggstorage):
+    with pytest.raises(DirectoryTraversalError) as exc:
+        eggstorage.put(io.BytesIO(b"data"), "../p", "v")  # version is sanitized
 
-    def test_list_secure_glob(self):
-        self.eggst.put(BytesIO(b"egg01"), 'mybot', '01')
-        versions = self.eggst.list('*')
+    assert str(exc.value) == "../p"
 
-        self.eggst.delete('mybot')
-        self.assertEqual(versions, [])  # ['01'] if * not escaped
 
-    def test_delete(self):
-        with pytest.raises(DirectoryTraversalError) as exc:
-            self.eggst.delete("../p", "v")  # version is sanitized
+def test_get_secure(eggstorage):
+    with pytest.raises(DirectoryTraversalError) as exc:
+        eggstorage.get("../p", "v")  # version is sanitized
 
-        self.assertEqual(str(exc.value), "../p")
+    assert str(exc.value) == "../p"
 
-    @patch('scrapyd.eggstorage.glob', new=lambda x: ['ddd', 'abc', 'bcaa'])
-    def test_list_hashes(self):
-        versions = self.eggst.list('any')
 
-        self.assertEqual(versions, ['abc', 'bcaa', 'ddd'])
+def test_list_secure_join(eggstorage):
+    with pytest.raises(DirectoryTraversalError) as exc:
+        eggstorage.list("../p")
 
-    @patch('scrapyd.eggstorage.glob', new=lambda x: ['9', '2', '200', '3', '4'])
-    def test_list_semantic_versions(self):
-        versions = self.eggst.list('any')
+    assert str(exc.value) == "../p"
 
-        self.assertEqual(versions, ['2', '3', '4', '9', '200'])
 
-    def test_put_get_list_delete(self):
-        self.eggst.put(BytesIO(b"egg01"), 'mybot', '01')
-        self.eggst.put(BytesIO(b"egg03"), 'mybot', '03/ver')
-        self.eggst.put(BytesIO(b"egg02"), 'mybot', '02_my branch')
+def test_list_secure_glob(eggstorage):
+    eggstorage.put(io.BytesIO(b"data"), "mybot", "01")
 
-        self.assertEqual(self.eggst.list('mybot'), [
-            '01',
-            '02_my_branch',
-            '03_ver'
-        ])
-        self.assertEqual(self.eggst.list('mybot2'), [])
+    assert eggstorage.list("*") == []  # ["01"] if * weren't escaped
 
-        v, f = self.eggst.get('mybot')
-        try:
-            self.assertEqual(v, "03_ver")
-            self.assertEqual(f.read(), b"egg03")
-        finally:
-            f.close()
 
-        v, f = self.eggst.get('mybot', '02_my branch')
-        try:
-            self.assertEqual(v, "02_my branch")
-            self.assertEqual(f.read(), b"egg02")
-        finally:
-            f.close()
+def test_delete_secure(eggstorage):
+    with pytest.raises(DirectoryTraversalError) as exc:
+        eggstorage.delete("../p", "v")  # version is sanitized
 
-        v, f = self.eggst.get('mybot', '02_my_branch')
-        try:
-            self.assertEqual(v, "02_my_branch")
-            self.assertEqual(f.read(), b"egg02")
-        finally:
-            f.close()
+    assert str(exc.value) == "../p"
 
-        self.eggst.delete('mybot', '02_my branch')
-        self.assertEqual(self.eggst.list('mybot'), ['01', '03_ver'])
 
-        self.eggst.delete('mybot', '03_ver')
-        self.assertEqual(self.eggst.list('mybot'), ['01'])
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        (None, (None, None)),
+        ("nonexistent", (None, None)),
+        ("01", (None, None)),
+    ],
+)
+def test_get_empty(eggstorage, version, expected):
+    assert eggstorage.get("mybot", version) == expected
 
-        self.eggst.delete('mybot')
-        self.assertEqual(self.eggst.list('mybot'), [])
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        (None, ("03", b"egg03")),
+        ("nonexistent", (None, None)),
+        ("01", ("01", b"egg01")),
+    ],
+)
+def test_get_many(eggstorage, version, expected):
+    eggstorage.put(io.BytesIO(b"egg01"), "mybot", "01")
+    eggstorage.put(io.BytesIO(b"egg03"), "mybot", "03")
+    eggstorage.put(io.BytesIO(b"egg02"), "mybot", "02")
+
+    version, data = eggstorage.get("mybot", version)
+    if data is not None:
+        with closing(data):
+            data = data.read()
+
+    assert (version, data) == expected
+
+
+@pytest.mark.parametrize(
+    ("versions", "expected"),
+    [(["ddd", "abc", "bcaa"], ["abc", "bcaa", "ddd"]), (["9", "2", "200", "3", "4"], ["2", "3", "4", "9", "200"])],
+)
+def test_list(eggstorage, versions, expected):
+    assert eggstorage.list("mybot") == []
+
+    for version in versions:
+        eggstorage.put(io.BytesIO(b"egg01"), "mybot", version)
+
+    assert eggstorage.list("mybot") == expected
+
+
+def test_list_glob(eggstorage):
+    directory = os.path.join(eggstorage.basedir, "mybot")
+    os.makedirs(directory)
+    with open(os.path.join(directory, "other"), "wb") as f:
+        f.write(b"")
+
+    assert eggstorage.list("mybot") == []  # "other" without "*.egg" glob
+
+
+def test_list_projects(eggstorage):
+    with open(os.path.join(eggstorage.basedir, "other"), "wb") as f:
+        f.write(b"")
+
+    assert eggstorage.list_projects() == []  # "other" without isdir() filter
+
+    eggstorage.put(io.BytesIO(b"egg01"), "mybot", "01")
+
+    assert eggstorage.list_projects() == ["mybot"]
+
+
+def test_delete_project(eggstorage):
+    eggstorage.put(io.BytesIO(b"egg01"), "mybot", "01")
+    eggstorage.put(io.BytesIO(b"egg03"), "mybot", "03")
+    eggstorage.put(io.BytesIO(b"egg02"), "mybot", "02")
+
+    assert eggstorage.list("mybot") == ["01", "02", "03"]
+
+    eggstorage.delete("mybot")
+
+    assert eggstorage.list("mybot") == []
+
+
+def test_delete_vesrion(eggstorage):
+    eggstorage.put(io.BytesIO(b"egg01"), "mybot", "01")
+    eggstorage.put(io.BytesIO(b"egg03"), "mybot", "03")
+    eggstorage.put(io.BytesIO(b"egg02"), "mybot", "02")
+
+    assert eggstorage.list("mybot") == ["01", "02", "03"]
+
+    eggstorage.delete("mybot", "02")
+
+    assert eggstorage.list("mybot") == ["01", "03"]
+
+    eggstorage.delete("mybot", "03")
+
+    assert eggstorage.list("mybot") == ["01"]
+
+    eggstorage.delete("mybot", "01")
+
+    assert eggstorage.list("mybot") == []
+    assert not os.path.exists(os.path.join(eggstorage.basedir, "mybot"))
+
+
+def test_delete_nonexistent_project(eggstorage):
+    with pytest.raises(ProjectNotFoundError):
+        eggstorage.delete("mybot")
+
+
+def test_delete_nonexistent_version(eggstorage):
+    with pytest.raises(EggNotFoundError):
+        eggstorage.delete("mybot", "01")
+
+    eggstorage.put(io.BytesIO(b"egg01"), "mybot", "01")
+
+    with pytest.raises(EggNotFoundError):
+        eggstorage.delete("mybot", "02")

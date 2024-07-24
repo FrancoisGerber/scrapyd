@@ -1,11 +1,7 @@
-.. _api:
-
 API
 ===
 
-The following section describes the available resources in Scrapyd JSON API.
-
-If basic authentication is enabled, you can use ``curl`` with the ``-u`` option, for example:
+If :ref:`basic authentication<username>` is enabled, you can use ``curl``'s ``-u`` option in the examples below, for example:
 
 .. code-block:: shell
 
@@ -15,6 +11,8 @@ If basic authentication is enabled, you can use ``curl`` with the ``-u`` option,
 
 daemonstatus.json
 -----------------
+
+.. versionadded:: 1.2.0
 
 To check the load status of a service.
 
@@ -33,7 +31,7 @@ Example:
 addversion.json
 ---------------
 
-Add a version to a project, creating the project if needed.
+Add a version to a project in :ref:`eggstorage`, creating the project if needed.
 
 Supported request methods
   ``POST``
@@ -42,10 +40,24 @@ Parameters
     the project name
   ``version`` (required)
     the project version
+
+    Scrapyd uses the packaging `Version <https://packaging.pypa.io/en/stable/version.html>`__ to interpret the version numbers you provide.
   ``egg`` (required)
     a Python egg containing the project's code
 
-.. note:: Scrapyd uses the `packaging Version <https://packaging.pypa.io/en/stable/version.html>`__ to interpret the version numbers you provide.
+    The egg must set an entry point to its Scrapy settings. For example, with a ``setup.py`` file:
+
+    .. code-block:: python
+       :emphasize-lines: 5
+
+       setup(
+           name         = 'project',
+           version      = '1.0',
+           packages     = find_packages(),
+           entry_points = {'scrapy': ['settings = projectname.settings']},
+       )
+
+    Do this easily with the `scrapyd-deploy` command from the `scrapyd-client <https://github.com/scrapy/scrapyd-client>`__ package.
 
 Example:
 
@@ -60,6 +72,10 @@ schedule.json
 -------------
 
 Schedule a job. (A job is a `Scrapy crawl <https://docs.scrapy.org/en/latest/topics/commands.html#crawl>`__.)
+
+If the :ref:`logs_dir` setting is set, log files are written to ``{logs_dir}/{project}/{spider}/{jobid}.log``. Set the ``jobid`` parameter to configure the basename of the log file.
+
+.. important:: Like Scrapy's ``scrapy.Spider`` class, spiders should allow an arbitrary number of keyword arguments in their ``__init__`` method, because Scrapyd sets internally-generated spider arguments when starting crawls.
 
 Supported request methods
   ``POST``
@@ -91,8 +107,11 @@ Parameters
 
        curl http://localhost:6800/schedule.json -d arg1=val1 -d project=myproject -d spider=somespider
 
-If the :ref:`logs_dir` setting is set, log files are written to ``{logs_dir}/{project}/{spider}/{jobid}.log``.
-Set the ``jobid`` parameter to configure the basename of the log file.
+    .. warning::
+
+       When such parameters are set multiple times, only the first value is sent to the spider.
+
+       To change this behavior, please `open an issue <https://github.com/scrapy/scrapyd/issues>`__.
 
 Example:
 
@@ -100,10 +119,6 @@ Example:
 
    $ curl http://localhost:6800/schedule.json -d project=myproject -d spider=somespider
    {"node_name": "mynodename", "status": "ok", "jobid": "6487ec79947edab326d6db28a2d86511e8247444"}
-
-.. note:: Spiders scheduled with Scrapyd should allow for an arbitrary number of keyword arguments, as Scrapyd sends internally-generated spider arguments to the spider being scheduled.
-
-.. note:: When a parameter other than ``setting`` is entered multiple times with ``-d``, only the first value is sent to the spider.
 
 .. _status.json:
 
@@ -146,6 +161,8 @@ Parameters
     the project name
   ``job`` (required)
     the job ID
+  ``signal``
+    the `signal <https://docs.python.org/3/library/signal.html#module-contents>`__ to send to the Scrapy process (``BREAK`` by default on Windows and ``INT`` by default, otherwise)
 
 Example:
 
@@ -176,7 +193,7 @@ Example:
 listversions.json
 -----------------
 
-Get the versions of a project, in order, with the latest version last.
+Get the versions of a project in :ref:`eggstorage`, in :ref:`order<overview-order>`, with the latest version last.
 
 Supported request methods
   ``GET``
@@ -197,6 +214,8 @@ listspiders.json
 ----------------
 
 Get the spiders in a version of a project.
+
+.. note:: If the project is configured via a :ref:`scrapy.cfg<config-settings>` file rather than uploaded via the :ref:`addversion.json` webservice, don't set the ``version`` parameter.
 
 Supported request methods
   ``GET``
@@ -242,21 +261,25 @@ Example:
        "status": "ok",
        "pending": [
            {
-               "project": "myproject", "spider": "spider1",
-               "id": "78391cc0fcaf11e1b0090800272a6d06"
+               "id": "78391cc0fcaf11e1b0090800272a6d06",
+               "project": "myproject",
+               "spider": "spider1"
            }
        ],
        "running": [
            {
                "id": "422e608f9f28cef127b3d5ef93fe9399",
-               "project": "myproject", "spider": "spider2",
-               "start_time": "2012-09-12 10:14:03.594664"
+               "project": "myproject",
+               "spider": "spider2",
+               "start_time": "2012-09-12 10:14:03.594664",
+               "pid": 93956
            }
        ],
        "finished": [
            {
                "id": "2f16646cfcaf11e1b0090800272a6d06",
-               "project": "myproject", "spider": "spider3",
+               "project": "myproject",
+               "spider": "spider3",
                "start_time": "2012-09-12 10:14:03.594664",
                "end_time": "2012-09-12 10:24:03.594664",
                "log_url": "/logs/myproject/spider3/2f16646cfcaf11e1b0090800272a6d06.log",
@@ -270,7 +293,7 @@ Example:
 delversion.json
 ---------------
 
-Delete a version of a project. If no versions of the project remain, delete the project, too.
+Delete a version of a project from :ref:`eggstorage`. If no versions of the project remain, delete the project, too.
 
 Supported request methods
   ``POST``
@@ -292,7 +315,7 @@ Example:
 delproject.json
 ---------------
 
-Delete a project and its versions.
+Delete a project and its versions from :ref:`eggstorage`.
 
 Supported request methods
   ``POST``

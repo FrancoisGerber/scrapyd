@@ -1,67 +1,74 @@
+import pytest
 from twisted.internet.defer import inlineCallbacks, maybeDeferred
-from twisted.trial import unittest
 from zope.interface.verify import verifyObject
 
-from scrapyd import spiderqueue
 from scrapyd.config import Config
 from scrapyd.interfaces import ISpiderQueue
+from scrapyd.spiderqueue import SqliteSpiderQueue
+
+spider_args = {
+    "arg1": "val1",
+    "arg2": 2,
+    "arg3": "\N{SNOWMAN}",
+}
+expected = spider_args.copy()
+expected["name"] = "spider1"
 
 
-class SpiderQueueTest(unittest.TestCase):
-    """This test case also supports queues with deferred methods.
-    """
+@pytest.fixture()
+def spiderqueue():
+    return SqliteSpiderQueue(Config(values={"dbs_dir": ":memory:"}), "quotesbot")
 
-    def setUp(self):
-        self.q = spiderqueue.SqliteSpiderQueue(Config(values={'dbs_dir': ':memory:'}), 'quotesbot')
-        self.name = 'spider1'
-        self.priority = 5
-        self.args = {
-            'arg1': 'val1',
-            'arg2': 2,
-            'arg3': u'\N{SNOWMAN}',
-        }
-        self.msg = self.args.copy()
-        self.msg['name'] = self.name
 
-    def test_interface(self):
-        verifyObject(ISpiderQueue, self.q)
+def test_interface(spiderqueue):
+    verifyObject(ISpiderQueue, spiderqueue)
 
-    @inlineCallbacks
-    def test_add_pop_count(self):
-        c = yield maybeDeferred(self.q.count)
-        self.assertEqual(c, 0)
 
-        yield maybeDeferred(self.q.add, self.name, self.priority, **self.args)
+@inlineCallbacks
+def test_pop(spiderqueue):
+    yield maybeDeferred(spiderqueue.add, "spider0", 5)
+    yield maybeDeferred(spiderqueue.add, "spider1", 10, **spider_args)
+    yield maybeDeferred(spiderqueue.add, "spider1", 0)
 
-        c = yield maybeDeferred(self.q.count)
-        self.assertEqual(c, 1)
+    assert (yield maybeDeferred(spiderqueue.count)) == 3
 
-        m = yield maybeDeferred(self.q.pop)
-        self.assertEqual(m, self.msg)
+    assert (yield maybeDeferred(spiderqueue.pop)) == expected
 
-        c = yield maybeDeferred(self.q.count)
-        self.assertEqual(c, 0)
+    assert (yield maybeDeferred(spiderqueue.count)) == 2
 
-    @inlineCallbacks
-    def test_list(self):
-        actual = yield maybeDeferred(self.q.list)
-        self.assertEqual(actual, [])
 
-        yield maybeDeferred(self.q.add, self.name, self.priority, **self.args)
-        yield maybeDeferred(self.q.add, self.name, self.priority, **self.args)
+@inlineCallbacks
+def test_list(spiderqueue):
+    assert (yield maybeDeferred(spiderqueue.list)) == []
 
-        actual = yield maybeDeferred(self.q.list)
-        self.assertEqual(actual, [self.msg, self.msg])
+    yield maybeDeferred(spiderqueue.add, "spider1", 10, **spider_args)
+    yield maybeDeferred(spiderqueue.add, "spider1", 10, **spider_args)
 
-    @inlineCallbacks
-    def test_clear(self):
-        yield maybeDeferred(self.q.add, self.name, self.priority, **self.args)
-        yield maybeDeferred(self.q.add, self.name, self.priority, **self.args)
+    assert (yield maybeDeferred(spiderqueue.list)) == [expected, expected]
 
-        c = yield maybeDeferred(self.q.count)
-        self.assertEqual(c, 2)
 
-        yield maybeDeferred(self.q.clear)
+@inlineCallbacks
+def test_remove(spiderqueue):
+    yield maybeDeferred(spiderqueue.add, "spider0", 5)
+    yield maybeDeferred(spiderqueue.add, "spider1", 10, **spider_args)
+    yield maybeDeferred(spiderqueue.add, "spider1", 0)
 
-        c = yield maybeDeferred(self.q.count)
-        self.assertEqual(c, 0)
+    assert (yield maybeDeferred(spiderqueue.count)) == 3
+
+    assert (yield maybeDeferred(spiderqueue.remove, lambda message: message["name"] == "spider1")) == 2
+
+    assert (yield maybeDeferred(spiderqueue.count)) == 1
+
+
+@inlineCallbacks
+def test_clear(spiderqueue):
+    assert (yield maybeDeferred(spiderqueue.count)) == 0
+
+    yield maybeDeferred(spiderqueue.add, "spider1", 10, **spider_args)
+    yield maybeDeferred(spiderqueue.add, "spider1", 10, **spider_args)
+
+    assert (yield maybeDeferred(spiderqueue.count)) == 2
+
+    yield maybeDeferred(spiderqueue.clear)
+
+    assert (yield maybeDeferred(spiderqueue.count)) == 0

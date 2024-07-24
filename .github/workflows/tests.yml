@@ -7,7 +7,7 @@ jobs:
     strategy:
       matrix:
         os: [macos-latest, windows-latest, ubuntu-latest]
-        python-version: [3.8, 3.9, "3.10", "3.11", "3.12", pypy-3.9]
+        python-version: [3.8, 3.9, "3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,8 +17,8 @@ jobs:
           cache-dependency-path: setup.py
       - run: pip install -e .[test]
       - run: pytest tests --cov scrapyd
-      - if: matrix.os != 'macos-latest' || matrix.python-version != 'pypy-3.9'
-        name: Run integration tests
+      # Occasional "ConnectionRefusedError: [Errno 111] Connection refused".
+      - name: Run integration tests
         run: |
           printf "[scrapyd]\nusername = hello12345\npassword = 67890world\n" > scrapyd.conf
           mkdir logs

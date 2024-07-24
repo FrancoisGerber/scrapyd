@@ -3,18 +3,24 @@ import re
 import shutil
 from glob import escape, glob
 
+from packaging.version import InvalidVersion, Version
 from zope.interface import implementer
 
-from scrapyd.exceptions import DirectoryTraversalError
+from scrapyd.exceptions import DirectoryTraversalError, EggNotFoundError, ProjectNotFoundError
 from scrapyd.interfaces import IEggStorage
-from scrapyd.utils import sorted_versions
+
+
+def sorted_versions(versions):
+    try:
+        return sorted(versions, key=Version)
+    except InvalidVersion:
+        return sorted(versions)
 
 
 @implementer(IEggStorage)
-class FilesystemEggStorage(object):
-
+class FilesystemEggStorage:
     def __init__(self, config):
-        self.basedir = config.get('eggs_dir', 'eggs')
+        self.basedir = config.get("eggs_dir", "eggs")
 
     def put(self, eggfile, project, version):
         path = self._egg_path(project, version)
@@ -23,7 +29,7 @@ class FilesystemEggStorage(object):
         if not os.path.exists(directory):
             os.makedirs(directory)
 
-        with open(path, 'wb') as f:
+        with open(path, "wb") as f:
             shutil.copyfileobj(eggfile, f)
 
     def get(self, project, version=None):
@@ -32,7 +38,10 @@ class FilesystemEggStorage(object):
                 version = self.list(project)[-1]
             except IndexError:
                 return None, None
-        return version, open(self._egg_path(project, version), 'rb')
+        try:
+            return version, open(self._egg_path(project, version), "rb")  # noqa: SIM115
+        except FileNotFoundError:
+            return None, None
 
     def list(self, project):
         return sorted_versions(
@@ -46,14 +55,20 @@ class FilesystemEggStorage(object):
 
     def delete(self, project, version=None):
         if version is None:
-            shutil.rmtree(self._get_path(project))
+            try:
+                shutil.rmtree(self._get_path(project))
+            except FileNotFoundError as e:
+                raise ProjectNotFoundError from e
         else:
-            os.remove(self._egg_path(project, version))
-            if not self.list(project):  # remove project if no versions left
-                self.delete(project)
+            try:
+                os.remove(self._egg_path(project, version))
+                if not self.list(project):  # remove project if no versions left
+                    self.delete(project)
+            except FileNotFoundError as e:
+                raise EggNotFoundError from e
 
     def _egg_path(self, project, version):
-        sanitized_version = re.sub(r'[^A-Za-z0-9_-]', '_', version)
+        sanitized_version = re.sub(r"[^A-Za-z0-9_-]", "_", version)
         return self._get_path(project, f"{sanitized_version}.egg")
 
     def _get_path(self, project, *trusted):

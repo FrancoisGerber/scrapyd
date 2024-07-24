@@ -1,216 +1,629 @@
-from pathlib import Path
-from unittest import mock
+import datetime
+import io
+import os
+import re
+import sys
+from unittest.mock import MagicMock, call
 
 import pytest
+from twisted.web import error
 
 from scrapyd.exceptions import DirectoryTraversalError, RunnerError
 from scrapyd.interfaces import IEggStorage
 from scrapyd.jobstorage import Job
+from scrapyd.launcher import ScrapyProcessProtocol
+from scrapyd.webservice import spider_list
+from tests import get_egg_data, has_settings, root_add_version
+
+job1 = Job(
+    project="p1",
+    spider="s1",
+    job="j1",
+    start_time=datetime.datetime(2001, 2, 3, 4, 5, 6, 7),
+    end_time=datetime.datetime(2001, 2, 3, 4, 5, 6, 8),
+)
 
 
-def fake_list_jobs(*args, **kwargs):
-    yield Job('proj1', 'spider-a', 'id1234')
+@pytest.fixture()
+def scrapy_process():
+    process = ScrapyProcessProtocol(project="p1", spider="s1", job="j1", env={}, args=[])
+    process.start_time = datetime.datetime(2001, 2, 3, 4, 5, 6, 9)
+    process.transport = MagicMock()
+    return process
 
 
-def fake_list_spiders(*args, **kwargs):
-    return []
+def get_local_projects(root):
+    return ["localproject"] if has_settings() else []
 
 
-def fake_list_spiders_other(*args, **kwarsg):
-    return ['quotesbot', 'toscrape-css']
+def add_test_version(app, project, version, basename):
+    app.getComponent(IEggStorage).put(io.BytesIO(get_egg_data(basename)), project, version)
 
 
-class TestWebservice:
-    @mock.patch('scrapyd.webservice.get_spider_list', new=fake_list_spiders)
-    def test_list_spiders(self, txrequest, site_no_egg):
-        # TODO Test with actual egg requires to write better mock runner
-        # scrapyd webservice calls subprocess with command
-        # "python -m scrapyd.runner list", need to write code to mock this
-        # and test it
-        txrequest.args = {
-            b'project': [b'quotesbot']
+def assert_content(txrequest, root, method, basename, args, expected):
+    txrequest.args = args.copy()
+    content = getattr(root.children[b"%b.json" % basename.encode()], f"render_{method}")(txrequest)
+
+    assert content.pop("node_name")
+    assert content == {"status": "ok", **expected}
+
+
+def assert_error(txrequest, root, method, basename, args, message):
+    txrequest.args = args.copy()
+    with pytest.raises(error.Error) as exc:
+        getattr(root.children[b"%b.json" % basename.encode()], f"render_{method}")(txrequest)
+
+    assert exc.value.status == b"200"
+    assert exc.value.message == message
+
+
+def test_spider_list(app):
+    add_test_version(app, "myproject", "r1", "mybot")
+    spiders = spider_list.get("myproject", None, runner="scrapyd.runner")
+    assert sorted(spiders) == ["spider1", "spider2"]
+
+    # Use the cache.
+    add_test_version(app, "myproject", "r2", "mybot2")
+    spiders = spider_list.get("myproject", None, runner="scrapyd.runner")
+    assert sorted(spiders) == ["spider1", "spider2"]  # mybot2 has 3 spiders, but the cache wasn't evicted
+
+    # Clear the cache.
+    spider_list.delete("myproject")
+    spiders = spider_list.get("myproject", None, runner="scrapyd.runner")
+    assert sorted(spiders) == ["spider1", "spider2", "spider3"]
+
+    # Re-add the 2-spider version and clear the cache.
+    add_test_version(app, "myproject", "r3", "mybot")
+    spider_list.delete("myproject")
+    spiders = spider_list.get("myproject", None, runner="scrapyd.runner")
+    assert sorted(spiders) == ["spider1", "spider2"]
+
+    # Re-add the 3-spider version and clear the cache, but use a lower version number.
+    add_test_version(app, "myproject", "r1a", "mybot2")
+    spider_list.delete("myproject")
+    spiders = spider_list.get("myproject", None, runner="scrapyd.runner")
+    assert sorted(spiders) == ["spider1", "spider2"]
+
+
+def test_spider_list_log_stdout(app):
+    add_test_version(app, "logstdout", "logstdout", "logstdout")
+    spiders = spider_list.get("logstdout", None, runner="scrapyd.runner")
+
+    assert sorted(spiders) == ["spider1", "spider2"]  # [] if LOG_STDOUT were enabled
+
+
+def test_spider_list_unicode(app):
+    add_test_version(app, "myprojectunicode", "r1", "mybotunicode")
+    spiders = spider_list.get("myprojectunicode", None, runner="scrapyd.runner")
+
+    assert sorted(spiders) == ["araña1", "araña2"]
+
+
+def test_spider_list_error(app):
+    # mybot3.settings contains "raise Exception('This should break the `scrapy list` command')".
+    add_test_version(app, "myproject3", "r1", "mybot3")
+    with pytest.raises(RunnerError) as exc:
+        spider_list.get("myproject3", None, runner="scrapyd.runner")
+
+    assert re.search(f"Exception: This should break the `scrapy list` command{os.linesep}$", str(exc.value))
+
+
+@pytest.mark.parametrize(
+    ("method", "basename", "param", "args"),
+    [
+        ("POST", "schedule", "project", {}),
+        ("POST", "schedule", "project", {b"spider": [b"scrapy-css"]}),
+        ("POST", "schedule", "spider", {b"project": [b"quotesbot"]}),
+        ("POST", "cancel", "project", {}),
+        ("POST", "cancel", "project", {b"job": [b"aaa"]}),
+        ("POST", "cancel", "job", {b"project": [b"quotesbot"]}),
+        ("POST", "addversion", "project", {}),
+        ("POST", "addversion", "project", {b"version": [b"0.1"]}),
+        ("POST", "addversion", "version", {b"project": [b"quotesbot"]}),
+        ("GET", "listversions", "project", {}),
+        ("GET", "listspiders", "project", {}),
+        ("GET", "status", "job", {}),
+        ("POST", "delproject", "project", {}),
+        ("POST", "delversion", "project", {}),
+        ("POST", "delversion", "project", {b"version": [b"0.1"]}),
+        ("POST", "delversion", "version", {b"project": [b"quotesbot"]}),
+    ],
+)
+def test_required(txrequest, root_with_egg, method, basename, param, args):
+    message = b"'%b' parameter is required" % param.encode()
+    assert_error(txrequest, root_with_egg, method, basename, args, message)
+
+
+def test_invalid_utf8(txrequest, root):
+    args = {b"project": [b"\xc3\x28"]}
+    message = b"project is invalid: 'utf-8' codec can't decode byte 0xc3 in position 0: invalid continuation byte"
+    assert_error(txrequest, root, "GET", "listversions", args, message)
+
+
+def test_invalid_type(txrequest, root):
+    args = {b"project": [b"p"], b"spider": [b"s"], b"priority": [b"x"]}
+    message = b"priority is invalid: could not convert string to float: b'x'"
+    assert_error(txrequest, root, "POST", "schedule", args, message)
+
+
+def test_debug(txrequest, root):
+    root.debug = True
+
+    txrequest.method = "POST"
+    txrequest.args = {b"project": [b"p"], b"spider": [b"s"], b"priority": [b"x"]}
+    response = root.children[b"schedule.json"].render(txrequest).decode()
+
+    assert response.startswith("Traceback (most recent call last):")
+    assert response.endswith(
+        "twisted.web.error.Error: 200 priority is invalid: could not convert string to float: b'x'\n"
+    )
+
+
+def test_daemonstatus(txrequest, root_with_egg, scrapy_process):
+    expected = {"running": 0, "pending": 0, "finished": 0}
+    assert_content(txrequest, root_with_egg, "GET", "daemonstatus", {}, expected)
+
+    root_with_egg.launcher.finished.add(job1)
+    expected["finished"] += 1
+    assert_content(txrequest, root_with_egg, "GET", "daemonstatus", {}, expected)
+
+    root_with_egg.launcher.processes[0] = scrapy_process
+    expected["running"] += 1
+    assert_content(txrequest, root_with_egg, "GET", "daemonstatus", {}, expected)
+
+    root_with_egg.poller.queues["quotesbot"].add("quotesbot")
+    expected["pending"] += 1
+    assert_content(txrequest, root_with_egg, "GET", "daemonstatus", {}, expected)
+
+
+@pytest.mark.parametrize(
+    ("args", "spiders", "run_only_if_has_settings"),
+    [
+        ({b"project": [b"myproject"]}, ["spider1", "spider2", "spider3"], False),
+        ({b"project": [b"myproject"], b"_version": [b"r1"]}, ["spider1", "spider2"], False),
+        ({b"project": [b"localproject"]}, ["example"], True),
+    ],
+)
+def test_list_spiders(txrequest, root, args, spiders, run_only_if_has_settings):
+    if run_only_if_has_settings and not has_settings():
+        pytest.skip("[settings] section is not set")
+
+    root_add_version(root, "myproject", "r1", "mybot")
+    root_add_version(root, "myproject", "r2", "mybot2")
+    root.update_projects()
+
+    expected = {"spiders": spiders}
+    assert_content(txrequest, root, "GET", "listspiders", args, expected)
+
+
+@pytest.mark.parametrize(
+    ("args", "param", "run_only_if_has_settings"),
+    [
+        ({b"project": [b"nonexistent"]}, "project", False),
+        ({b"project": [b"myproject"], b"_version": [b"nonexistent"]}, "version", False),
+        ({b"project": [b"localproject"], b"_version": [b"nonexistent"]}, "version", True),
+    ],
+)
+def test_list_spiders_nonexistent(txrequest, root, args, param, run_only_if_has_settings):
+    if run_only_if_has_settings and not has_settings():
+        pytest.skip("[settings] section is not set")
+
+    root_add_version(root, "myproject", "r1", "mybot")
+    root_add_version(root, "myproject", "r2", "mybot2")
+    root.update_projects()
+
+    assert_error(txrequest, root, "GET", "listspiders", args, b"%b 'nonexistent' not found" % param.encode())
+
+
+def test_list_versions(txrequest, root_with_egg):
+    expected = {"versions": ["0_1"]}
+    assert_content(txrequest, root_with_egg, "GET", "listversions", {b"project": [b"quotesbot"]}, expected)
+
+
+def test_list_versions_nonexistent(txrequest, root):
+    expected = {"versions": []}
+    assert_content(txrequest, root, "GET", "listversions", {b"project": [b"localproject"]}, expected)
+
+
+def test_list_projects(txrequest, root_with_egg):
+    expected = {"projects": ["quotesbot", *get_local_projects(root_with_egg)]}
+    assert_content(txrequest, root_with_egg, "GET", "listprojects", {}, expected)
+
+
+def test_list_projects_empty(txrequest, root):
+    expected = {"projects": get_local_projects(root)}
+    assert_content(txrequest, root, "GET", "listprojects", {}, expected)
+
+
+@pytest.mark.parametrize("args", [{}, {b"project": [b"p1"]}])
+def test_status(txrequest, root, scrapy_process, args):
+    root_add_version(root, "p1", "r1", "mybot")
+    root_add_version(root, "p2", "r2", "mybot2")
+    root.update_projects()
+
+    if args:
+        root.launcher.finished.add(Job(project="p2", spider="s2", job="j1"))
+        root.launcher.processes[0] = ScrapyProcessProtocol("p2", "s2", "j1", {}, [])
+        root.poller.queues["p2"].add("s2", _job="j1")
+
+    expected = {"currstate": None}
+    assert_content(txrequest, root, "GET", "status", {b"job": [b"j1"], **args}, expected)
+
+    root.poller.queues["p1"].add("s1", _job="j1")
+
+    expected["currstate"] = "pending"
+    assert_content(txrequest, root, "GET", "status", {b"job": [b"j1"], **args}, expected)
+
+    root.launcher.processes[0] = scrapy_process
+
+    expected["currstate"] = "running"
+    assert_content(txrequest, root, "GET", "status", {b"job": [b"j1"], **args}, expected)
+
+    root.launcher.finished.add(job1)
+
+    expected["currstate"] = "finished"
+    assert_content(txrequest, root, "GET", "status", {b"job": [b"j1"], **args}, expected)
+
+
+def test_status_nonexistent(txrequest, root):
+    args = {b"job": [b"aaa"], b"project": [b"nonexistent"]}
+    assert_error(txrequest, root, "GET", "status", args, b"project 'nonexistent' not found")
+
+
+@pytest.mark.parametrize("args", [{}, {b"project": [b"p1"]}])
+def test_list_jobs(txrequest, root, scrapy_process, args):
+    root_add_version(root, "p1", "r1", "mybot")
+    root_add_version(root, "p2", "r2", "mybot2")
+    root.update_projects()
+
+    if args:
+        root.launcher.finished.add(Job(project="p2", spider="s2", job="j2"))
+        root.launcher.processes[0] = ScrapyProcessProtocol("p2", "s2", "j2", {}, [])
+        root.poller.queues["p2"].add("s2", _job="j2")
+
+    expected = {"pending": [], "running": [], "finished": []}
+    assert_content(txrequest, root, "GET", "listjobs", args, expected)
+
+    root.launcher.finished.add(job1)
+
+    expected["finished"].append(
+        {
+            "id": "j1",
+            "project": "p1",
+            "spider": "s1",
+            "start_time": "2001-02-03 04:05:06.000007",
+            "end_time": "2001-02-03 04:05:06.000008",
+            "items_url": "/items/p1/s1/j1.jl",
+            "log_url": "/logs/p1/s1/j1.log",
+        },
+    )
+    assert_content(txrequest, root, "GET", "listjobs", args, expected)
+
+    root.launcher.processes[0] = scrapy_process
+
+    expected["running"].append(
+        {
+            "id": "j1",
+            "project": "p1",
+            "spider": "s1",
+            "start_time": "2001-02-03 04:05:06.000009",
+            "pid": None,
         }
-        endpoint = b'listspiders.json'
-        content = site_no_egg.children[endpoint].render_GET(txrequest)
+    )
+    assert_content(txrequest, root, "GET", "listjobs", args, expected)
 
-        assert content['spiders'] == []
-        assert content['status'] == 'ok'
+    root.poller.queues["p1"].add(
+        "s1",
+        priority=5,
+        _job="j1",
+        _version="0.1",
+        settings={"DOWNLOAD_DELAY=2": "TRACK=Cause = Time"},
+        other="one",
+    )
 
-    def test_list_versions(self, txrequest, site_with_egg):
-        txrequest.args = {
-            b'project': [b'quotesbot'],
-            b'spider': [b'toscrape-css']
-        }
-        endpoint = b'listversions.json'
-        content = site_with_egg.children[endpoint].render_GET(txrequest)
+    expected["pending"].append(
+        {
+            "id": "j1",
+            "project": "p1",
+            "spider": "s1",
+            "version": "0.1",
+            "settings": {"DOWNLOAD_DELAY=2": "TRACK=Cause = Time"},
+            "args": {"other": "one"},
+        },
+    )
+    assert_content(txrequest, root, "GET", "listjobs", args, expected)
 
-        assert content['versions'] == ['0_1']
-        assert content['status'] == 'ok'
 
-    def test_list_projects(self, txrequest, site_with_egg):
-        txrequest.args = {
-            b'project': [b'quotesbot'],
-            b'spider': [b'toscrape-css']
-        }
-        endpoint = b'listprojects.json'
-        content = site_with_egg.children[endpoint].render_GET(txrequest)
+def test_list_jobs_nonexistent(txrequest, root):
+    args = {b"project": [b"nonexistent"]}
+    assert_error(txrequest, root, "GET", "listjobs", args, b"project 'nonexistent' not found")
 
-        assert content['projects'] == ['quotesbot']
 
-    def test_list_jobs(self, txrequest, site_with_egg):
-        txrequest.args = {}
-        endpoint = b'listjobs.json'
-        content = site_with_egg.children[endpoint].render_GET(txrequest)
+def test_delete_version(txrequest, root):
+    projects = get_local_projects(root)
 
-        assert set(content) == {'node_name', 'status', 'pending', 'running', 'finished'}
+    root_add_version(root, "myproject", "r1", "mybot")
+    root_add_version(root, "myproject", "r2", "mybot2")
+    root.update_projects()
 
-    @mock.patch('scrapyd.jobstorage.MemoryJobStorage.__iter__', new=fake_list_jobs)
-    def test_list_jobs_finished(self, txrequest, site_with_egg):
-        txrequest.args = {}
-        endpoint = b'listjobs.json'
-        content = site_with_egg.children[endpoint].render_GET(txrequest)
+    # Spiders (before).
+    expected = {"spiders": ["spider1", "spider2", "spider3"]}
+    assert_content(txrequest, root, "GET", "listspiders", {b"project": [b"myproject"]}, expected)
 
-        assert set(content['finished'][0]) == {
-            'project', 'spider', 'id', 'start_time', 'end_time', 'log_url', 'items_url'
-        }
+    # Delete one version.
+    args = {b"project": [b"myproject"], b"version": [b"r2"]}
+    assert_content(txrequest, root, "POST", "delversion", args, {"status": "ok"})
+    assert root.eggstorage.get("myproject", "r2") == (None, None)  # version is gone
 
-    def test_delete_version(self, txrequest, site_with_egg):
-        endpoint = b'delversion.json'
-        txrequest.args = {
-            b'project': [b'quotesbot'],
-            b'version': [b'0.1']
-        }
+    # Spiders (after) would contain "spider3" without cache eviction.
+    expected = {"spiders": ["spider1", "spider2"]}
+    assert_content(txrequest, root, "GET", "listspiders", {b"project": [b"myproject"]}, expected)
 
-        storage = site_with_egg.app.getComponent(IEggStorage)
-        version, egg = storage.get('quotesbot')
-        if egg:
-            egg.close()
+    # Projects (before).
+    assert_content(txrequest, root, "GET", "listprojects", {}, {"projects": ["myproject", *projects]})
 
-        content = site_with_egg.children[endpoint].render_POST(txrequest)
-        no_version, no_egg = storage.get('quotesbot')
-        if no_egg:
-            no_egg.close()
+    # Delete another version.
+    args = {b"project": [b"myproject"], b"version": [b"r1"]}
+    assert_content(txrequest, root, "POST", "delversion", args, {"status": "ok"})
+    assert root.eggstorage.get("myproject") == (None, None)  # project is gone
 
-        assert version is not None
-        assert content['status'] == 'ok'
-        assert 'node_name' in content
-        assert no_version is None
+    # Projects (after) would contain "myproject" without root.update_projects().
+    assert_content(txrequest, root, "GET", "listprojects", {}, {"projects": [*projects]})
 
-    def test_delete_project(self, txrequest, site_with_egg):
-        endpoint = b'delproject.json'
-        txrequest.args = {
-            b'project': [b'quotesbot'],
-        }
 
-        storage = site_with_egg.app.getComponent(IEggStorage)
-        version, egg = storage.get('quotesbot')
-        if egg:
-            egg.close()
+def test_delete_version_uncached(txrequest, root_with_egg):
+    args = {b"project": [b"quotesbot"], b"version": [b"0.1"]}
+    assert_content(txrequest, root_with_egg, "POST", "delversion", args, {"status": "ok"})
 
-        content = site_with_egg.children[endpoint].render_POST(txrequest)
-        no_version, no_egg = storage.get('quotesbot')
-        if no_egg:
-            no_egg.close()
 
-        assert version is not None
-        assert content['status'] == 'ok'
-        assert 'node_name' in content
-        assert no_version is None
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        ({b"project": [b"quotesbot"], b"version": [b"nonexistent"]}, b"version 'nonexistent' not found"),
+        ({b"project": [b"nonexistent"], b"version": [b"0.1"]}, b"version '0.1' not found"),
+    ],
+)
+def test_delete_version_nonexistent(txrequest, root_with_egg, args, message):
+    assert_error(txrequest, root_with_egg, "POST", "delversion", args, message)
 
-    @mock.patch('scrapyd.webservice.get_spider_list', new=fake_list_spiders)
-    def test_addversion(self, txrequest, site_no_egg):
-        endpoint = b'addversion.json'
-        txrequest.args = {
-            b'project': [b'quotesbot'],
-            b'version': [b'0.1']
-        }
-        egg_path = Path(__file__).absolute().parent / "quotesbot.egg"
-        with open(egg_path, 'rb') as f:
-            txrequest.args[b'egg'] = [f.read()]
 
-        storage = site_no_egg.app.getComponent(IEggStorage)
-        version, egg = storage.get('quotesbot')
-        if egg:
-            egg.close()
+def test_delete_project(txrequest, root_with_egg):
+    projects = get_local_projects(root_with_egg)
 
-        content = site_no_egg.children[endpoint].render_POST(txrequest)
-        no_version, no_egg = storage.get('quotesbot')
-        if no_egg:
-            no_egg.close()
+    # Spiders (before).
+    expected = {"spiders": ["toscrape-css", "toscrape-xpath"]}
+    assert_content(txrequest, root_with_egg, "GET", "listspiders", {b"project": [b"quotesbot"]}, expected)
 
-        assert version is None
-        assert content['status'] == 'ok'
-        assert 'node_name' in content
-        assert no_version == '0_1'
+    # Projects (before).
+    expected = {"projects": ["quotesbot", *projects]}
+    assert_content(txrequest, root_with_egg, "GET", "listprojects", {}, expected)
 
-    @mock.patch('scrapyd.webservice.get_spider_list',
-                new=fake_list_spiders_other)
-    def test_schedule(self, txrequest, site_with_egg):
-        endpoint = b'schedule.json'
-        txrequest.args = {
-            b'project': [b'quotesbot'],
-            b'spider': [b'toscrape-css']
-        }
+    # Delete the project.
+    args = {b"project": [b"quotesbot"]}
+    assert_content(txrequest, root_with_egg, "POST", "delproject", args, {"status": "ok"})
+    assert root_with_egg.eggstorage.get("quotesbot") == (None, None)  # project is gone
 
-        content = site_with_egg.children[endpoint].render_POST(txrequest)
+    # Spiders (after).
+    args = {b"project": [b"quotesbot"]}
+    assert_error(txrequest, root_with_egg, "GET", "listspiders", args, b"project 'quotesbot' not found")
 
-        assert site_with_egg.scheduler.calls == [['quotesbot', 'toscrape-css']]
-        assert content['status'] == 'ok'
-        assert 'jobid' in content
+    # Projects (after) would contain "quotesbot" without root.update_projects().
+    expected = {"projects": [*projects]}
+    assert_content(txrequest, root_with_egg, "GET", "listprojects", {}, expected)
 
-    @pytest.mark.parametrize('endpoint,attach_egg,method', [
-        (b'addversion.json', True, 'render_POST'),
-        (b'listversions.json', False, 'render_GET'),
-        (b'delproject.json', False, 'render_POST'),
-        (b'delversion.json', False, 'render_POST'),
-    ])
-    def test_bad_project_names(self, txrequest, site_no_egg, endpoint, attach_egg, method):
-        txrequest.args = {
-            b'project': [b'../p'],
-            b'version': [b'0.1'],
-        }
 
-        if attach_egg:
-            egg_path = Path(__file__).absolute().parent / "quotesbot.egg"
-            with open(egg_path, 'rb') as f:
-                txrequest.args[b'egg'] = [f.read()]
+def test_delete_project_uncached(txrequest, root_with_egg):
+    args = {b"project": [b"quotesbot"]}
+    assert_content(txrequest, root_with_egg, "POST", "delproject", args, {"status": "ok"})
 
-        with pytest.raises(DirectoryTraversalError) as exc:
-            getattr(site_no_egg.children[endpoint], method)(txrequest)
 
-        assert str(exc.value) == "../p"
+def test_delete_project_nonexistent(txrequest, root):
+    args = {b"project": [b"nonexistent"]}
+    assert_error(txrequest, root, "POST", "delproject", args, b"project 'nonexistent' not found")
 
-        storage = site_no_egg.app.getComponent(IEggStorage)
-        version, egg = storage.get('quotesbot')
-        if egg:
-            egg.close()
 
-        assert version is None
+def test_add_version(txrequest, root):
+    assert root.eggstorage.get("quotesbot") == (None, None)
 
-    @pytest.mark.parametrize('endpoint,attach_egg,method', [
-        (b'schedule.json', False, 'render_POST'),
-        (b'listspiders.json', False, 'render_GET'),
-    ])
-    def test_bad_project_names_runner(self, txrequest, site_no_egg, endpoint, attach_egg, method):
-        txrequest.args = {
-            b'project': [b'../p'],
-            b'spider': [b's'],
-        }
+    # Add a version.
+    args = {b"project": [b"quotesbot"], b"version": [b"0.1"], b"egg": [get_egg_data("quotesbot")]}
+    expected = {"project": "quotesbot", "version": "0.1", "spiders": 2}
+    assert_content(txrequest, root, "POST", "addversion", args, expected)
+    assert root.eggstorage.list("quotesbot") == ["0_1"]
 
-        if attach_egg:
-            egg_path = Path(__file__).absolute().parent / "quotesbot.egg"
-            with open(egg_path, 'rb') as f:
-                txrequest.args[b'egg'] = [f.read()]
+    # Spiders (before).
+    expected = {"spiders": ["toscrape-css", "toscrape-xpath"]}
+    assert_content(txrequest, root, "GET", "listspiders", {b"project": [b"quotesbot"]}, expected)
 
-        with pytest.raises(RunnerError) as exc:
-            getattr(site_no_egg.children[endpoint], method)(txrequest)
+    # Add the same version with a different egg.
+    args = {b"project": [b"quotesbot"], b"version": [b"0.1"], b"egg": [get_egg_data("mybot2")]}
+    expected = {"project": "quotesbot", "version": "0.1", "spiders": 3}  # 2 without cache eviction
+    assert_content(txrequest, root, "POST", "addversion", args, expected)
+    assert root.eggstorage.list("quotesbot") == ["0_1"]  # overwrite version
 
-        assert str(exc.value).startswith("Traceback (most recent call last):"), str(exc.value)
-        assert str(exc.value).endswith("scrapyd.exceptions.DirectoryTraversalError: ../p\n"), str(exc.value)
+    # Spiders (after).
+    expected = {"spiders": ["spider1", "spider2", "spider3"]}
+    assert_content(txrequest, root, "GET", "listspiders", {b"project": [b"quotesbot"]}, expected)
 
-        storage = site_no_egg.app.getComponent(IEggStorage)
-        version, egg = storage.get('quotesbot')
-        if egg:
-            egg.close()
 
-        assert version is None
+def test_add_version_settings(txrequest, root):
+    if not has_settings():
+        pytest.skip("[settings] section is not set")
+
+    args = {b"project": [b"localproject"], b"version": [b"0.1"], b"egg": [get_egg_data("quotesbot")]}
+    expected = {"project": "localproject", "spiders": 2, "version": "0.1"}
+    assert_content(txrequest, root, "POST", "addversion", args, expected)
+
+
+def test_add_version_invalid(txrequest, root):
+    args = {b"project": [b"quotesbot"], b"version": [b"0.1"], b"egg": [b"invalid"]}
+    message = b"egg is not a ZIP file (if using curl, use egg=@path not egg=path)"
+    assert_error(txrequest, root, "POST", "addversion", args, message)
+
+
+# Like test_list_spiders.
+@pytest.mark.parametrize(
+    ("args", "run_only_if_has_settings"),
+    [
+        ({b"project": [b"myproject"], b"spider": [b"spider3"]}, False),
+        ({b"project": [b"myproject"], b"_version": [b"r1"], b"spider": [b"spider1"]}, False),
+        ({b"project": [b"localproject"], b"spider": [b"example"]}, True),
+    ],
+)
+def test_schedule(txrequest, root, args, run_only_if_has_settings):
+    if run_only_if_has_settings and not has_settings():
+        pytest.skip("[settings] section is not set")
+
+    project = args[b"project"][0].decode()
+    spider = args[b"spider"][0].decode()
+    version = args[b"_version"][0].decode() if b"_version" in args else None
+
+    root_add_version(root, "myproject", "r1", "mybot")
+    root_add_version(root, "myproject", "r2", "mybot2")
+    root.update_projects()
+
+    assert root.poller.queues[project].list() == []
+
+    txrequest.args = args.copy()
+    content = root.children[b"schedule.json"].render_POST(txrequest)
+    jobid = content.pop("jobid")
+
+    assert content.pop("node_name")
+    assert content == {"status": "ok"}
+    assert re.search(r"^[a-z0-9]{32}$", jobid)
+
+    jobs = root.poller.queues[project].list()
+    expected = {"name": spider, "_job": jobid, "settings": {}}
+    if version:
+        expected["_version"] = version
+
+    assert len(jobs) == 1
+    assert jobs[0] == expected
+
+
+def test_schedule_parameters(txrequest, root_with_egg):
+    txrequest.args = {
+        b"project": [b"quotesbot"],
+        b"spider": [b"toscrape-css"],
+        b"_version": [b"0.1"],
+        b"jobid": [b"aaa"],
+        b"priority": [b"5"],
+        b"setting": [b"DOWNLOAD_DELAY=2", b"TRACK=Cause = Time"],
+        b"other": [b"one", b"two"],
+    }
+    content = root_with_egg.children[b"schedule.json"].render_POST(txrequest)
+
+    assert content.pop("node_name")
+    assert content == {"status": "ok", "jobid": "aaa"}
+
+    jobs = root_with_egg.poller.queues["quotesbot"].list()
+
+    assert len(jobs) == 1
+    assert jobs[0] == {
+        "name": "toscrape-css",
+        "_version": "0.1",
+        "_job": "aaa",
+        "settings": {
+            "DOWNLOAD_DELAY": "2",
+            "TRACK": "Cause = Time",
+        },
+        "other": "one",  # users are encouraged in api.rst to open an issue if they want multiple values
+    }
+
+
+# Like test_list_spiders_nonexistent.
+@pytest.mark.parametrize(
+    ("args", "param", "run_only_if_has_settings"),
+    [
+        ({b"project": [b"nonexistent"], b"spider": [b"spider1"]}, "project", False),
+        ({b"project": [b"myproject"], b"_version": [b"nonexistent"], b"spider": [b"spider1"]}, "version", False),
+        ({b"project": [b"myproject"], b"spider": [b"nonexistent"]}, "spider", False),
+        ({b"project": [b"localproject"], b"_version": [b"nonexistent"], b"spider": [b"example"]}, "version", True),
+    ],
+)
+def test_schedule_nonexistent(txrequest, root, args, param, run_only_if_has_settings):
+    if run_only_if_has_settings and not has_settings():
+        pytest.skip("[settings] section is not set")
+
+    root_add_version(root, "myproject", "r1", "mybot")
+    root_add_version(root, "myproject", "r2", "mybot2")
+    root.update_projects()
+
+    assert_error(txrequest, root, "POST", "schedule", args, b"%b 'nonexistent' not found" % param.encode())
+
+
+@pytest.mark.parametrize("args", [{}, {b"signal": [b"TERM"]}])
+def test_cancel(txrequest, root, scrapy_process, args):
+    signal = "TERM" if args else ("INT" if sys.platform != "win32" else "BREAK")
+
+    root_add_version(root, "p1", "r1", "mybot")
+    root_add_version(root, "p2", "r2", "mybot2")
+    root.update_projects()
+
+    args = {b"project": [b"p1"], b"job": [b"j1"], **args}
+
+    expected = {"prevstate": None}
+    assert_content(txrequest, root, "POST", "cancel", args, expected)
+
+    root.poller.queues["p1"].add("s1", _job="j1")
+    root.poller.queues["p1"].add("s1", _job="j1")
+    root.poller.queues["p1"].add("s1", _job="j2")
+
+    assert root.poller.queues["p1"].count() == 3
+    expected["prevstate"] = "pending"
+    assert_content(txrequest, root, "POST", "cancel", args, expected)
+    assert root.poller.queues["p1"].count() == 1
+
+    root.launcher.processes[0] = scrapy_process
+    root.launcher.processes[1] = scrapy_process
+    root.launcher.processes[2] = ScrapyProcessProtocol("p2", "s2", "j2", {}, [])
+
+    expected["prevstate"] = "running"
+    assert_content(txrequest, root, "POST", "cancel", args, expected)
+    assert scrapy_process.transport.signalProcess.call_count == 2
+    scrapy_process.transport.signalProcess.assert_has_calls([call(signal), call(signal)])
+
+
+def test_cancel_nonexistent(txrequest, root):
+    args = {b"project": [b"nonexistent"], b"job": [b"aaa"]}
+    assert_error(txrequest, root, "POST", "cancel", args, b"project 'nonexistent' not found")
+
+
+# ListSpiders, Schedule, Cancel, Status and ListJobs return "project '%b' not found" on directory traversal attempts.
+# The egg storage (in get_project_list, called by get_spider_queues, called by QueuePoller, used by these webservices)
+# would need to find a project like "../project" (which is impossible with the default eggstorage) to not error.
+@pytest.mark.parametrize(
+    ("method", "basename", "args"),
+    [
+        ("POST", "cancel", {b"project": [b"../p"], b"job": [b"aaa"]}),
+        ("GET", "status", {b"project": [b"../p"], b"job": [b"aaa"]}),
+        ("GET", "listspiders", {b"project": [b"../p"]}),
+        ("GET", "listjobs", {b"project": [b"../p"]}),
+    ],
+)
+def test_project_directory_traversal_notfound(txrequest, root, method, basename, args):
+    assert_error(txrequest, root, method, basename, args, b"project '../p' not found")
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "attach_egg", "method"),
+    [
+        (b"addversion.json", True, "render_POST"),
+        (b"listversions.json", False, "render_GET"),
+        (b"delproject.json", False, "render_POST"),
+        (b"delversion.json", False, "render_POST"),
+    ],
+)
+def test_project_directory_traversal(txrequest, root, endpoint, attach_egg, method):
+    txrequest.args = {b"project": [b"../p"], b"version": [b"0.1"]}
+
+    if attach_egg:
+        txrequest.args[b"egg"] = [get_egg_data("quotesbot")]
+
+    with pytest.raises(DirectoryTraversalError) as exc:
+        getattr(root.children[endpoint], method)(txrequest)
+
+    assert str(exc.value) == "../p"
+
+    eggstorage = root.app.getComponent(IEggStorage)
+    assert eggstorage.get("quotesbot") == (None, None)
