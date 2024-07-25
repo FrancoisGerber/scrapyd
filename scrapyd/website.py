@@ -1,3 +1,4 @@
+import json
 import socket
 from datetime import datetime, timedelta
 from html import escape
@@ -138,7 +139,8 @@ class Root(resource.Resource):
         self.prefix_header = config.get("prefix_header")
         self.local_items = items_dir and (urlparse(items_dir).scheme.lower() in ["", "file"])
         self.nodename = config.get("node_name", socket.gethostname())
-        self.pollerName = config.get("poller", "scrapyd.poller.QueuePoller")
+        self.pollername = config.get("poller", "scrapyd.poller.QueuePoller")
+        self.config = json.dumps(config, indent=4)
 
         self.putChild(b"", Home(self, self.local_items))
         if logs_dir:
@@ -215,8 +217,13 @@ monitoring)</p>
 
 <p>For more information about the API, see the
 <a href="https://scrapyd.readthedocs.io/en/latest/">Scrapyd documentation</a></p>
+<p></p>
+
+<h3>Huntress Setup</h3>
 """
-        s += f"""<p>Huntress: {self.pollerName}</p>"""
+        s += f"""<p>Poller: {self.pollername}</p>"""
+        s += f"""<p>Host: {self.nodename}</p>"""
+        s += f"""<pre><code>{self.config}</code></pre>"""
         s += """
 </body>
 </html>
