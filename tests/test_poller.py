@@ -80,3 +80,8 @@ def test_poll_empty(poller):
     assert hasattr(value, "result")
     assert getattr(value, "called", False)
     assert value.result is None
+
+if __name__ == "__main__":
+    test = QueuePollerTest()
+    test.setUp()
+    test.test_poll_next()

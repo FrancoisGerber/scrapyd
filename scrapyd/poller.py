@@ -1,4 +1,5 @@
 from twisted.internet.defer import DeferredQueue, inlineCallbacks, maybeDeferred
+from random import sample
 from zope.interface import implementer
 
 from scrapyd.interfaces import IPoller
@@ -20,6 +21,43 @@ class QueuePoller:
                 if not self.dq.waiting:
                     return
                 message = (yield maybeDeferred(queue.pop)).copy()
+
+                # The message can be None if, for example, two Scrapyd instances share a spider queue database.
+                if message is not None:
+                    message["_project"] = project
+                    message["_spider"] = message.pop("name")
+                    # Pop a dummy item from the "waiting" backlog. and fire the message's callbacks.
+                    self.dq.put(message)
+
+    def next(self):
+        """
+        Add a dummy item to the "waiting" backlog (based on Twisted's implementation of DeferredQueue).
+        """
+        return self.dq.get()
+
+    def update_projects(self):
+        self.queues = get_spider_queues(self.config)
+
+@implementer(IPoller)
+class RandomQueueOrderPoller:
+    '''
+        An override for the poller that takes a random sample of queues to pull from to prevent the "single queu prio" issue
+    '''
+    def __init__(self, config):
+        self.config = config
+        self.update_projects()
+        self.dq = DeferredQueue()
+
+    @inlineCallbacks
+    def poll(self):
+        queueSlice = sample(list(self.queues.items()), len(self.queues))
+        for project, queue in queueSlice:
+            while (yield maybeDeferred(queue.count)):
+                # If the "waiting" backlog is empty (that is, if the maximum number of Scrapy processes are running):
+                if not self.dq.waiting:
+                    return
+                message = (yield maybeDeferred(queue.pop)).copy()
+
                 # The message can be None if, for example, two Scrapyd instances share a spider queue database.
                 if message is not None:
                     message["_project"] = project
