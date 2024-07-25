@@ -138,6 +138,7 @@ class Root(resource.Resource):
         self.prefix_header = config.get("prefix_header")
         self.local_items = items_dir and (urlparse(items_dir).scheme.lower() in ["", "file"])
         self.nodename = config.get("node_name", socket.gethostname())
+        self.pollerName = config.get("poller", "scrapyd.poller.QueuePoller")
 
         self.putChild(b"", Home(self, self.local_items))
         if logs_dir:
@@ -214,8 +215,9 @@ monitoring)</p>
 
 <p>For more information about the API, see the
 <a href="https://scrapyd.readthedocs.io/en/latest/">Scrapyd documentation</a></p>
-
-<p>Huntress</p>
+"""
+        s += f"""<p>Huntress: {self.pollerName}</p>"""
+        s += """
 </body>
 </html>
 """
