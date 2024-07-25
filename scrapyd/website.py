@@ -1,4 +1,3 @@
-import json
 import socket
 from datetime import datetime, timedelta
 from html import escape
@@ -140,7 +139,6 @@ class Root(resource.Resource):
         self.local_items = items_dir and (urlparse(items_dir).scheme.lower() in ["", "file"])
         self.nodename = config.get("node_name", socket.gethostname())
         self.pollername = config.get("poller", "scrapyd.poller.QueuePoller")
-        self.config = json.dumps(config, indent=4)
 
         self.putChild(b"", Home(self, self.local_items))
         if logs_dir:
@@ -221,9 +219,8 @@ monitoring)</p>
 
 <h3>Huntress Setup</h3>
 """
-        s += f"""<p>Poller: {self.pollername}</p>"""
-        s += f"""<p>Host: {self.nodename}</p>"""
-        s += f"""<pre><code>{self.config}</code></pre>"""
+        s += f"""<p>Poller: {self.root.pollername}</p>"""
+        s += f"""<p>Host: {self.root.nodename}</p>"""
         s += """
 </body>
 </html>
